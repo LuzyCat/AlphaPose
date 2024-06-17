@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import datetime
 import platform
 
 import argparse
@@ -16,11 +17,12 @@ from threading import Thread
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, QTextEdit,
                                QToolBar, QFileDialog, QMessageBox, QStyle, QMenu,
+                               QSpinBox, QComboBox, QGroupBox,
                                QTabWidget, QHBoxLayout, QVBoxLayout, QWidget)
-from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QFont, QIcon, QAction, QKeySequence
+from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QFont, QIcon, QAction, QKeySequence, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaFormat, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QObject
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -227,6 +229,25 @@ cfg = update_config(args.cfg)
 #     def read(self):
 #         return self.pose
 
+class QTextEditLogger(QObject):
+    write_signal = Signal(str)
+
+    def __init__(self, text_edit):
+        super().__init__()
+        self.text_edit = text_edit
+        self.write_signal.connect(self.write_to_text_edit)
+
+    def write(self, message):
+        self.write_signal.emit(message)
+
+    def flush(self):
+        pass
+
+    def write_to_text_edit(self, message):
+        self.text_edit.moveCursor(QTextCursor.End)
+        self.text_edit.insertPlainText(message)
+        self.text_edit.moveCursor(QTextCursor.End)
+
 class DataWriter():
     def __init__(self, cfg, opt, queueSize=1024):
         self.cfg = cfg
@@ -384,30 +405,15 @@ class DataWriter():
         return self.final_result
 
     def write_json(self):
-        write_json(self.final_result, self.opt.outputpath, form=self.opt.format, for_eval=self.opt.eval)
-        print("Results have been written to json.")
-        return
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(self.opt.outputpath, timestamp)
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        write_json(self.final_result, output_dir, form=self.opt.format, for_eval=self.opt.eval)
+        print(f"Results have been written to {output_dir}")
 
-class InferenceThread(QThread):
-    infResult = Signal(float)
-
-    def __init__(self, inference_fps):
-        super().__init__()
-        self.stopped = False
-        self.inference_fps = inference_fps
-
-    def run(self):
-        cur_time = time.time()
-        while not self.stopped:
-            self.infResult.emit(cur_time)
-            if self.inference_fps > 0:
-                sleep_time = 1 / self.inference_fps - (time.time() - cur_time)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            cur_time = time.time()
-
-    def stop(self):
-        self.stopped = True
 
 class MainWindow(QMainWindow):
     def __init__(self, args, cfg):
@@ -418,22 +424,25 @@ class MainWindow(QMainWindow):
         self.mode = None
         self.input_source = None
         self.mode, self.input_source = self.check_input()
-        # self.inference_fps = 30
+        self.inference_fps = 29.95
 
         self.__check__options()
         self.__initUI()
         self.__initialize()
         
-        self.is_webcam = False
+        self.is_running = False
         self.cap = None
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_result)
-        # self.inference_thread = InferenceThread(self.inference_fps)
-        # self.inference_thread.infResult.connect(self.update_result)
+
+        # QTextEditLogger 설정
+        self.logger = QTextEditLogger(self.log_text_edit)
+        sys.stdout = self.logger
+
 
     def __initUI(self):
         self.setWindowTitle("Pose Tracking Application")
-        self.setGeometry(100, 100, 1000, 800)
+        self.setGeometry(100, 100, 1100, 800)
 
         # menu & toolbar
         tool_bar = QToolBar()
@@ -487,8 +496,50 @@ class MainWindow(QMainWindow):
         tab_widget.addTab(video_tab, "Video")
 
         main_layout.addWidget(tab_widget)
- 
+    
+        # control panel layout
+        control_panel_layout = QVBoxLayout()
 
+        # Create a group box to contain status, frame, persons, model
+        self.info_group_box = QGroupBox("Information")
+        info_layout = QVBoxLayout()
+        
+        # Pose tracking status display
+        self.status_label = QLabel("Status: Ready")
+        info_layout.addWidget(self.status_label)
+
+        # frame number/time stamp display
+        self.frame_label = QLabel("Frame: 0")
+        info_layout.addWidget(self.frame_label)
+
+        # 인식된 사람 수
+        self.person_count_label = QLabel("Persons: 0")  
+        info_layout.addWidget(self.person_count_label)
+
+        # Model
+        self.model_label = QLabel("Model:")
+        info_layout.addWidget(self.model_label)
+
+        self.info_group_box.setLayout(info_layout)
+        control_panel_layout.addWidget(self.info_group_box)
+
+        # FPS control
+        self.fps_label = QLabel("FPS: 30")
+        control_panel_layout.addWidget(self.fps_label)
+        self.fps_spinbox = QSpinBox()
+        self.fps_spinbox.setRange(1, 60)
+        self.fps_spinbox.setValue(30)
+        self.fps_spinbox.valueChanged.connect(self.set_fps)
+        control_panel_layout.addWidget(self.fps_spinbox)
+
+
+        # log
+        self.log_text_edit = QTextEdit()
+        self.log_text_edit.setReadOnly(True)
+        self.log_text_edit.setStyleSheet("background-color: #2E2E2E; color: white;")
+        control_panel_layout.addWidget(self.log_text_edit)
+
+        main_layout.addLayout(control_panel_layout)
 
         """AlphaPose"""
 
@@ -506,12 +557,10 @@ class MainWindow(QMainWindow):
             torch.multiprocessing.set_sharing_strategy('file_system')
 
     def __initialize(self):
-        # Load detection loader
-        self.det_loader = WebCamDetectionLoader(self.input_source, get_detector(self.args), self.cfg, self.args)
-
         # Load pose model
         self.pose_model = builder.build_sppe(self.cfg.MODEL, preset_cfg=self.cfg.DATA_PRESET)
 
+        self.model_label.setText("Model: " + self.args.checkpoint)
         print('Loading pose model from %s...' % (self.args.checkpoint,))
         self.pose_model.load_state_dict(torch.load(self.args.checkpoint, map_location=self.args.device))
         self.pose_dataset = builder.retrieve_dataset(self.cfg.DATASET.TRAIN)
@@ -545,19 +594,30 @@ class MainWindow(QMainWindow):
         self.update_timer.stop()
         self.det_loader.terminate()
         self.writer.stop()
-        # self.inference_thread.stop()
         event.accept()
+    
+    @Slot()
+    def set_fps(self, fps):
+        if not self.is_running:
+            self.inference_fps = fps
+            self.fps_label.setText("FPS: " + fps)
 
     @Slot()
     def capture(self):
-        if not self.is_webcam:
-            self.is_webcam = True
+        if not self.is_running:
+            self.is_running = True
+            self.status_label.setText("Status: Tracking...")
+            self.status_label.setStyleSheet("color: red;")
+            # Load detection loader
+            self.det_loader = WebCamDetectionLoader(self.input_source, get_detector(self.args), self.cfg, self.args)
             self.det_worker = self.det_loader.start()
-            self.update_timer.start(30)
-            # print("Inference Thread Start...")
-            # self.inference_thread.start()
+            print("Load Camera...")
+            self.update_timer.start(self.inference_fps)
         else:
-            self.is_webcam = False
+            self.is_running = False
+            print("=== Finish Model Running ===")
+            self.status_label.setText("Status: Ready")
+            self.status_label.setStyleSheet("color: black;")
             self.update_timer.stop()
             self.writer.write_json()
             if self.args.sp:
@@ -568,8 +628,6 @@ class MainWindow(QMainWindow):
                 self.writer.stop()
                 self.writer.clear_queues()
                 self.det_loader.clear_queues()
-            # self.inference_thread.stop()
-            return
     
     def update_webcam(self, frame):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -662,6 +720,15 @@ class MainWindow(QMainWindow):
                     'det time: {dt:.4f} | pose time: {pt:.4f} | post processing: {pn:.4f}'.format(
                         dt=np.mean(runtime_profile['dt']), pt=np.mean(runtime_profile['pt']), pn=np.mean(runtime_profile['pn']))
                 )
+
+            # Increment frame label
+            current_frame = int(self.frame_label.text().split(": ")[1])  # Extract the current frame number
+            self.frame_label.setText(f"Frame: {current_frame + 1}")  # Update the frame label
+
+            # Update person count
+            person_count = boxes.size(0) if boxes is not None else 0
+            self.person_count_label.setText(f"Persons: {person_count}")
+
         except Exception as e:
             print(repr(e))
             print('An error as above occurs when processing the images, please check it')
@@ -687,10 +754,10 @@ class MainWindow(QMainWindow):
             image = self.writer.vis_frame(image, pose, self.writer.opt, self.writer.vis_thres)
         return image
 
-    def writeJson(self, final_result, outputpath, form='coco', for_eval=False):
-        from alphapose.utils.pPose_nms import write_json
-        write_json(final_result, outputpath, form=form, for_eval=for_eval)
-        print("Results have been written to json.")
+    # def writeJson(self, final_result, outputpath, form='coco', for_eval=False):
+    #     from alphapose.utils.pPose_nms import write_json
+    #     write_json(final_result, outputpath, form=form, for_eval=for_eval)
+    #     print("Results have been written to json.")
 
 
 if __name__ == "__main__":
