@@ -10,6 +10,9 @@ import torch.multiprocessing as mp
 import numpy as np
 from pathlib import Path
 from queue import Queue
+from threading import Thread
+# # debug
+# import debugpy
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, QTextEdit,
                                QToolBar, QFileDialog, QMessageBox, QStyle, QMenu,
@@ -17,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, Q
 from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QFont, QIcon, QAction, QKeySequence
 from PySide6.QtMultimedia import QAudioOutput, QMediaFormat, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -256,13 +259,13 @@ class DataWriter():
             self.vis_thres = [0.4] * (num_joints - hand_face_num) + [0.05] * hand_face_num
 
         self.use_heatmap_loss = (self.cfg.DATA_PRESET.get('LOSS_TYPE', 'MSELoss') == 'MSELoss')
+        self.final_result = []
 
     def start(self):
         # start to read pose estimation results
         return self.update()
 
     def update(self):
-        final_result = []
         norm_type = self.cfg.LOSS.get('NORM_TYPE', None)
         hm_size = self.cfg.DATA_PRESET.HEATMAP_SIZE
 
@@ -334,7 +337,7 @@ class DataWriter():
                 for i in range(len(poseflow_result)):
                     result['result'][i]['idx'] = poseflow_result[i]['idx']
 
-            final_result.append(result)
+            self.final_result.append(result)
 
             if hm_data.size()[1] == 49:
                 from alphapose.utils.vis import vis_frame_dense as vis_frame
@@ -367,11 +370,6 @@ class DataWriter():
     def stop(self):
         # indicate that the thread should be stopped
         self.save(None, None, None, None, None, None, None)
-        self.result_worker.join()
-
-    def terminate(self):
-        # directly terminate
-        self.result_worker.terminate()
 
     def clear_queues(self):
         self.clear(self.result_queue)
@@ -384,6 +382,11 @@ class DataWriter():
         # return final result
         print(self.final_result)
         return self.final_result
+
+    def write_json(self):
+        write_json(self.final_result, self.opt.outputpath, form=self.opt.format, for_eval=self.opt.eval)
+        print("Results have been written to json.")
+        return
 
 class InferenceThread(QThread):
     infResult = Signal(float)
@@ -415,15 +418,18 @@ class MainWindow(QMainWindow):
         self.mode = None
         self.input_source = None
         self.mode, self.input_source = self.check_input()
-        self.inference_fps = 30
+        # self.inference_fps = 30
 
         self.__check__options()
         self.__initUI()
+        self.__initialize()
         
         self.is_webcam = False
         self.cap = None
-        self.inference_thread = InferenceThread(self.inference_fps)
-        self.inference_thread.infResult.connect(self.update_result)
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update_result)
+        # self.inference_thread = InferenceThread(self.inference_fps)
+        # self.inference_thread.infResult.connect(self.update_result)
 
     def __initUI(self):
         self.setWindowTitle("Pose Tracking Application")
@@ -536,21 +542,34 @@ class MainWindow(QMainWindow):
             raise NotImplementedError
 
     def closeEvent(self, event):
+        self.update_timer.stop()
         self.det_loader.terminate()
         self.writer.stop()
-        self.inference_thread.stop()
+        # self.inference_thread.stop()
         event.accept()
 
     @Slot()
     def capture(self):
-        self.__initialize()
         if not self.is_webcam:
             self.is_webcam = True
-            print("Inference Thread Start...")
-            self.inference_thread.start()
+            self.det_worker = self.det_loader.start()
+            self.update_timer.start(30)
+            # print("Inference Thread Start...")
+            # self.inference_thread.start()
         else:
             self.is_webcam = False
-            self.inference_thread.stop()
+            self.update_timer.stop()
+            self.writer.write_json()
+            if self.args.sp:
+                self.det_loader.terminate()
+                self.writer.stop()
+            else:
+                self.det_loader.terminate()
+                self.writer.stop()
+                self.writer.clear_queues()
+                self.det_loader.clear_queues()
+            # self.inference_thread.stop()
+            return
     
     def update_webcam(self, frame):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -559,15 +578,14 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(q_image)
         self._webcam_widget.setPixmap(pixmap)
         self._webcam_widget.setAlignment(Qt.AlignCenter)
-        self.frame_queue.append(np.array(frame[:, :, ::-1]))
     
-    def update_result(self, cur_time):
+    def update_result(self):
         pose = self.process()
         img = self.getImg()
         img = self.vis(img, pose)
         self.update_webcam(img)
-        result = [pose]
-        self.writeJson(result, self.args.outputpath, form=self.args.format, for_eval=self.args.eval)
+        # result = [pose]
+        # self.writeJson(result, self.args.outputpath, form=self.args.format, for_eval=self.args.eval)
 
     def process(self):
         runtime_profile = {
@@ -644,7 +662,6 @@ class MainWindow(QMainWindow):
                     'det time: {dt:.4f} | pose time: {pt:.4f} | post processing: {pn:.4f}'.format(
                         dt=np.mean(runtime_profile['dt']), pt=np.mean(runtime_profile['pt']), pn=np.mean(runtime_profile['pn']))
                 )
-            print('===========================> Finish Model Running.')
         except Exception as e:
             print(repr(e))
             print('An error as above occurs when processing the images, please check it')
@@ -656,7 +673,7 @@ class MainWindow(QMainWindow):
                 self.writer.stop()
             else:
                 self.det_loader.terminate()
-                self.writer.terminate()
+                self.writer.stop()
                 self.writer.clear_queues()
                 self.det_loader.clear_queues()
 
@@ -678,9 +695,8 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    fontDB = QFontDatabase()
-    fontDB.addApplicationFont('demo/font/Supreme-Medium.otf')
-    fontDB.addApplicationFont('./font/NotoSansKR-Regular.otf')
+    QFontDatabase.addApplicationFont('demo/font/Supreme-Medium.otf')
+    QFontDatabase.addApplicationFont('./font/NotoSansKR-Regular.otf')
     app.setFont(QFont('Noto Sans KR', 12))
     main_win = MainWindow(args, cfg)
     available_geometry = main_win.screen().availableGeometry()

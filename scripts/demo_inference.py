@@ -25,10 +25,12 @@ from alphapose.utils.writer import DataWriter
 
 """----------------------------- Demo options -----------------------------"""
 parser = argparse.ArgumentParser(description='AlphaPose Demo')
-parser.add_argument('--cfg', type=str, required=True,
-                    help='experiment configure file name')
-parser.add_argument('--checkpoint', type=str, required=True,
-                    help='checkpoint file name')
+parser.add_argument('--cfg', type=str,
+                    help='experiment configure file name',
+                    default='configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml')
+parser.add_argument('--checkpoint', type=str,
+                    help='checkpoint file name',
+                    default='pretrained_models/fast_res50_256x192.pth')
 parser.add_argument('--sp', default=False, action='store_true',
                     help='Use single process for pytorch')
 parser.add_argument('--detector', dest='detector',
@@ -73,7 +75,7 @@ parser.add_argument('--debug', default=False, action='store_true',
 parser.add_argument('--video', dest='video',
                     help='video-name', default="")
 parser.add_argument('--webcam', dest='webcam', type=int,
-                    help='webcam number', default=-1)
+                    help='webcam number', default=0)
 parser.add_argument('--save_video', dest='save_video',
                     help='whether to save rendered video', default=False, action='store_true')
 parser.add_argument('--vis_fast', dest='vis_fast',
